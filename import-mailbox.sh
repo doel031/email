@@ -1,27 +1,78 @@
 #!/bin/bash
 
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "Usage:"
+    echo "  Single Account: $0 <account_email> </path/to/backup.tgz>"
+    echo "  Batch / List:   $0 [-p <parallel_jobs>] /path/to/input_file.csv"
+    exit 0
+fi
+
 # Ensure running as root
 if [ "$EUID" -ne 0 ]; then
     echo "Error: Please run this script as root!"
     exit 1
 fi
 
-TARGET_ACCOUNT="$1"
-TGZ_FILE="$2"
+MAX_PARALLEL=5
+INPUT_FILE=""
+TARGET_ACCOUNT=""
+TGZ_FILE=""
+MODE=""
 
-if [ -z "$TARGET_ACCOUNT" ] || [ -z "$TGZ_FILE" ]; then
-    echo "Error: Account or backup file not specified!"
-    echo "Usage: $0 <account_email> </path/to/backup.tgz>"
-    exit 1
-fi
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -p|--parallel)
+            if [ -z "$2" ] || ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -le 0 ]; then
+                echo "Error: Parallel jobs (-p/--parallel) must be a positive integer."
+                exit 1
+            fi
+            MAX_PARALLEL="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage:"
+            echo "  Single Account: $0 <account_email> </path/to/backup.tgz>"
+            echo "  Batch / List:   $0 [-p <parallel_jobs>] /path/to/input_file.csv"
+            exit 0
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
 
-if ! [[ "$TARGET_ACCOUNT" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-    echo "Error: Invalid account email: '$TARGET_ACCOUNT'"
-    exit 1
-fi
+if [ ${#POSITIONAL_ARGS[@]} -eq 2 ]; then
+    MODE="single"
+    TARGET_ACCOUNT="${POSITIONAL_ARGS[0]}"
+    TGZ_FILE="${POSITIONAL_ARGS[1]}"
 
-if [ ! -f "$TGZ_FILE" ]; then
-    echo "Error: Backup file not found: $TGZ_FILE"
+    if ! [[ "$TARGET_ACCOUNT" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        echo "Error: Invalid account email: '$TARGET_ACCOUNT'"
+        exit 1
+    fi
+
+    if [ ! -f "$TGZ_FILE" ]; then
+        echo "Error: Backup file not found: $TGZ_FILE"
+        exit 1
+    fi
+elif [ ${#POSITIONAL_ARGS[@]} -eq 1 ]; then
+    MODE="batch"
+    INPUT_FILE="${POSITIONAL_ARGS[0]}"
+
+    if [ ! -f "$INPUT_FILE" ]; then
+        echo "Error: Input file not found: $INPUT_FILE"
+        echo "Usage:"
+        echo "  Single Account: $0 <account_email> </path/to/backup.tgz>"
+        echo "  Batch / List:   $0 [-p <parallel_jobs>] /path/to/input_file.csv"
+        exit 1
+    fi
+else
+    echo "Error: Invalid arguments!"
+    echo "Usage:"
+    echo "  Single Account: $0 <account_email> </path/to/backup.tgz>"
+    echo "  Batch / List:   $0 [-p <parallel_jobs>] /path/to/input_file.csv"
     exit 1
 fi
 
@@ -59,26 +110,32 @@ fi
 BASE_LOG_DIR="/var/log/restore-mailbox"
 mkdir -p "$BASE_LOG_DIR"
 
-# Find highest existing batch number to create the next batch directory
-max_batch=0
-for dir in "$BASE_LOG_DIR"/batch-*; do
-    if [ -d "$dir" ]; then
-        bname=$(basename "$dir")
-        num="${bname#batch-}"
-        if [[ "$num" =~ ^[0-9]+$ ]]; then
-            if [ "$num" -gt "$max_batch" ]; then
-                max_batch="$num"
+if [ "$MODE" = "single" ]; then
+    LOG_DIR="$BASE_LOG_DIR/single"
+    mkdir -p "$LOG_DIR"
+    SUMMARY_LOG="/dev/null"
+else
+    # Find highest existing batch number to create the next batch directory
+    max_batch=0
+    for dir in "$BASE_LOG_DIR"/batch-*; do
+        if [ -d "$dir" ]; then
+            bname=$(basename "$dir")
+            num="${bname#batch-}"
+            if [[ "$num" =~ ^[0-9]+$ ]]; then
+                if [ "$num" -gt "$max_batch" ]; then
+                    max_batch="$num"
+                fi
             fi
         fi
-    fi
-done
+    done
 
-next_batch=$((max_batch + 1))
-LOG_DIR="$BASE_LOG_DIR/batch-$next_batch"
-mkdir -p "$LOG_DIR"
+    next_batch=$((max_batch + 1))
+    LOG_DIR="$BASE_LOG_DIR/batch-$next_batch"
+    mkdir -p "$LOG_DIR"
 
-SUMMARY_LOG="$LOG_DIR/summary_report.txt"
-> "$SUMMARY_LOG" # Reset summary file
+    SUMMARY_LOG="$LOG_DIR/summary_report.txt"
+    > "$SUMMARY_LOG" # Reset summary file
+fi
 
 PROGRESS_DIR="$LOG_DIR/progress"
 mkdir -p "$PROGRESS_DIR"
@@ -829,46 +886,91 @@ EOF
     } > "$ACCOUNT_LOG" 2>&1
 }
 
-process_account "$TARGET_ACCOUNT" "$TGZ_FILE" &
-CHILD_PIDS+=("$!")
+if [ "$MODE" = "single" ]; then
+    process_account "$TARGET_ACCOUNT" "$TGZ_FILE" &
+    CHILD_PIDS+=("$!")
 
-while [ $(jobs -r | wc -l) -gt 0 ]; do
+    while [ $(jobs -r | wc -l) -gt 0 ]; do
+        print_status
+        sleep 2
+    done
+    wait
     print_status
-    sleep 2
-done
-wait
-print_status
-echo ""
-echo "=================================================="
-echo "              IMPORT RESULTS SUMMARY"
-echo "=================================================="
-if [ -f "$SUMMARY_LOG" ]; then
-    cat "$SUMMARY_LOG" | sort
-    
-    success_count=$(grep "✅ SUCCESS" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
-    quota_count=$(grep "⚠️ QUOTA EXCEEDED" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
-    error_count=$(grep "⚠️ WITH ERRORS" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
-    skipped_count=$(grep "⏭️ SKIPPED" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
-    fail_count=$(grep "❌ FAILED" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
-    total_accounts=$((success_count + quota_count + error_count + skipped_count + fail_count))
 
-    tot_msgs=$(awk -F'Total: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[,)]' '{sum += $1} END {print sum+0}')
-    tot_imported=$(awk -F'Imported: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[,)]' '{sum += $1} END {print sum+0}')
-    tot_duplicate=$(awk -F'Duplicate: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[,)]' '{sum += $1} END {print sum+0}')
-    tot_failed=$(awk -F'Failed[^:]*: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[, -)]' '{sum += $1} END {print sum+0}')
-
-    echo "--------------------------------------------------"
-    echo "Mail Server Platform : $MAIL_PLATFORM (User: $MAIL_USER)"
-    echo "Total Accounts       : $total_accounts (Success: $success_count, Quota Exceeded: $quota_count, Errors: $error_count, Skipped: $skipped_count, Failed: $fail_count)"
-    echo "Total Messages       : $tot_msgs"
-    echo "Total Imported       : $tot_imported"
-    echo "Total Duplicates     : $tot_duplicate"
-    if [ "$tot_failed" -gt 0 ]; then
-        echo "Total Failed/Unsaved : $tot_failed"
-    fi
+    rmdir "$RESTORE_TEMP_BASE" 2>/dev/null
+    rm -rf "$PROGRESS_DIR" 2>/dev/null
+    echo ""
+    echo "Restore completed for $TARGET_ACCOUNT! Log saved to: $LOG_DIR/${TARGET_ACCOUNT}.log"
 else
-    echo "No summary data available."
+    while IFS=',' read -r TARGET_ACCOUNT TGZ_FILE; do
+        TARGET_ACCOUNT=$(echo "$TARGET_ACCOUNT" | xargs)
+        TGZ_FILE=$(echo "$TGZ_FILE" | xargs)
+        
+        [ -z "$TARGET_ACCOUNT" ] || [ -z "$TGZ_FILE" ] && continue
+        case "$TARGET_ACCOUNT" in
+            \#*|[aA]ccount|[eE]mail|TARGET_ACCOUNT) continue ;; # Skip comments and header rows
+        esac
+
+        # SECURITY: Validate email address format to protect against shell metacharacter injection
+        if ! [[ "$TARGET_ACCOUNT" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+            echo "⚠️  Skipping invalid account entry: '$TARGET_ACCOUNT' (not a valid email address)" | tee -a "$SUMMARY_LOG"
+            continue
+        fi
+
+        # Verify backup file existence before spawning background job
+        if [ ! -f "$TGZ_FILE" ]; then
+            echo "❌ FAILED: $TARGET_ACCOUNT (backup file not found: $TGZ_FILE)" >> "$SUMMARY_LOG"
+            continue
+        fi
+
+        process_account "$TARGET_ACCOUNT" "$TGZ_FILE" &
+        CHILD_PIDS+=("$!")
+
+        while [ $(jobs -r | wc -l) -ge $MAX_PARALLEL ]; do
+            print_status
+            sleep 2
+        done
+
+    done < "$INPUT_FILE"
+
+    while [ $(jobs -r | wc -l) -gt 0 ]; do
+        print_status
+        sleep 2
+    done
+    wait
+    print_status
+    echo ""
+    echo "=================================================="
+    echo "              IMPORT RESULTS SUMMARY"
+    echo "=================================================="
+    if [ -f "$SUMMARY_LOG" ]; then
+        cat "$SUMMARY_LOG" | sort
+        
+        success_count=$(grep "✅ SUCCESS" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
+        quota_count=$(grep "⚠️ QUOTA EXCEEDED" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
+        error_count=$(grep "⚠️ WITH ERRORS" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
+        skipped_count=$(grep "⏭️ SKIPPED" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
+        fail_count=$(grep "❌ FAILED" "$SUMMARY_LOG" 2>/dev/null | wc -l | tr -d ' ')
+        total_accounts=$((success_count + quota_count + error_count + skipped_count + fail_count))
+
+        tot_msgs=$(awk -F'Total: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[,)]' '{sum += $1} END {print sum+0}')
+        tot_imported=$(awk -F'Imported: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[,)]' '{sum += $1} END {print sum+0}')
+        tot_duplicate=$(awk -F'Duplicate: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[,)]' '{sum += $1} END {print sum+0}')
+        tot_failed=$(awk -F'Failed[^:]*: ' '{print $2}' "$SUMMARY_LOG" | awk -F'[, -)]' '{sum += $1} END {print sum+0}')
+
+        echo "--------------------------------------------------"
+        echo "Mail Server Platform : $MAIL_PLATFORM (User: $MAIL_USER)"
+        echo "Total Accounts       : $total_accounts (Success: $success_count, Quota Exceeded: $quota_count, Errors: $error_count, Skipped: $skipped_count, Failed: $fail_count)"
+        echo "Total Messages       : $tot_msgs"
+        echo "Total Imported       : $tot_imported"
+        echo "Total Duplicates     : $tot_duplicate"
+        if [ "$tot_failed" -gt 0 ]; then
+            echo "Total Failed/Unsaved : $tot_failed"
+        fi
+    else
+        echo "No summary data available."
+    fi
+    echo "=================================================="
+    rmdir "$RESTORE_TEMP_BASE" 2>/dev/null
+    echo "All bulk restore processes completed! Check detailed logs in $LOG_DIR/"
 fi
-echo "=================================================="
-rmdir "$RESTORE_TEMP_BASE" 2>/dev/null
-echo "All bulk restore processes completed! Check detailed logs in $LOG_DIR/"
